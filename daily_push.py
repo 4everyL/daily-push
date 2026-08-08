@@ -41,11 +41,8 @@ ROOT = Path(__file__).resolve().parent
 DOCS_DIR = ROOT / "docs"
 LOG_PATH = ROOT / "push.log"
 
-DEFAULT_WEBHOOK = (
-    "https://qyapi.weixin.qq.com/cgi-bin/webhook/send"
-    "?key=3c332191-56c4-471a-afff-adc9f0aa4a53"
-)
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or DEFAULT_WEBHOOK
+# 安全加固：移除他人硬编码的 Webhook，避免误推到他人群；请通过仓库 Secrets 配置 WEBHOOK_URL。
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or ""
 PAGES_URL = (os.environ.get("PAGES_URL") or "").rstrip("/")
 MODE = os.environ.get("MODE", "all").lower()
 
