@@ -7,7 +7,10 @@
 3. 推送企业微信图文卡片，点击跳转到 HTML 详情页
 
 环境变量：
-  WEBHOOK_URL  企微机器人 Webhook（必填，推送模式）
+  BOT_ID       企业微信智能机器人 BotID（推送必填）
+  BOT_SECRET   智能机器人长连接专用 Secret（推送必填）
+  CHAT_ID      推送目标会话 ID：单聊填企业微信 userid，群聊填群 chatid
+  CHAT_TYPE    1=单聊（默认） / 2=群聊
   PAGES_URL    HTML 托管根地址（云端模式必填），如：
                  https://<user>.github.io/<repo>
   MODE         html | push | all（默认 all）
@@ -22,12 +25,20 @@ import os
 import random
 import re
 import sys
+import threading
+import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+try:
+    import websocket
+except ImportError:
+    websocket = None
 
 
 BASE_API = "https://60s.viki.moe/v2"
@@ -41,8 +52,11 @@ ROOT = Path(__file__).resolve().parent
 DOCS_DIR = ROOT / "docs"
 LOG_PATH = ROOT / "push.log"
 
-# 安全加固：移除他人硬编码的 Webhook，避免误推到他人群；请通过仓库 Secrets 配置 WEBHOOK_URL。
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or ""
+# 企业微信智能机器人（长连接）推送凭证 —— 通过仓库 Secrets 配置，不硬编码
+BOT_ID = os.environ.get("BOT_ID") or ""
+BOT_SECRET = os.environ.get("BOT_SECRET") or ""
+CHAT_ID = os.environ.get("CHAT_ID") or ""            # 单聊填企业微信 userid；群聊填群 chatid
+CHAT_TYPE = int(os.environ.get("CHAT_TYPE") or "1")  # 1=单聊（默认）, 2=群聊
 PAGES_URL = (os.environ.get("PAGES_URL") or "").rstrip("/")
 MODE = os.environ.get("MODE", "all").lower()
 
@@ -1988,6 +2002,144 @@ def send_markdown_fallback(ctx: dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 企业微信智能机器人（长连接）主动推送
+# ---------------------------------------------------------------------------
+
+WS_URL = "wss://openws.work.weixin.qq.com"
+_ws_lock = threading.Lock()
+
+
+def _ws_send(ws, obj):
+    with _ws_lock:
+        ws.send(json.dumps(obj))
+
+
+def _send_cmd(ws, cmd: str, body: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
+    """发送一条 aibot 指令并等待匹配的响应；忽略期间其他回调。"""
+    rid = uuid.uuid4().hex
+    _ws_send(ws, {"cmd": cmd, "headers": {"req_id": rid}, "body": body})
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            raw = ws.recv()
+        except Exception:
+            break
+        if not raw:
+            continue
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            continue
+        if msg.get("headers", {}).get("req_id") == rid:
+            return msg
+    return {}
+
+
+def _heartbeat(ws, stop_ev):
+    while not stop_ev.is_set():
+        stop_ev.wait(29)
+        if stop_ev.is_set():
+            break
+        try:
+            with _ws_lock:
+                ws.ping()
+        except Exception:
+            break
+
+
+def build_aibot_markdown(ctx: dict[str, Any]) -> str:
+    """拼一条精简 markdown（控制在单聊 4096 字节上限内）。"""
+    date: datetime = ctx["date"]
+    weekday = "一二三四五六日"[date.weekday()]
+    lines = [f"# 📬 今日精选·{date:%m月%d日} 星期{weekday}\n"]
+
+    hot = ctx.get("hot") or {}
+    lines.append("## 🔥 热搜")
+    n = 0
+    for cat, items in hot.items():
+        for m in items[:3]:
+            lines.append(f"- {m['title']}")
+            n += 1
+            if n >= 8:
+                break
+        if n >= 8:
+            break
+
+    jokes = ctx.get("jokes") or []
+    if jokes:
+        lines.append("\n## 😄 冷笑话")
+        lines.append(f"- {jokes[0]}")
+
+    media = ctx.get("media") or {}
+    movies = media.get("movies") or []
+    musics = media.get("musics") or []
+    if movies or musics:
+        lines.append("\n## 🎬 影音")
+        for m in movies[:2]:
+            lines.append(f"- 《{m['title']}》· {m['subtitle']}")
+        for m in musics[:2]:
+            lines.append(f"- 🎵 {m['title']} - {m['subtitle']}")
+
+    if ctx.get("travels"):
+        lines.append("\n## 🧳 旅游推荐")
+        for t in ctx["travels"][:2]:
+            lines.append(f"- **{t['name']}**｜{t.get('season', '')}")
+
+    lines.append("\n> 完整版见网页 https://4everyl.github.io/daily-push/")
+    return "\n".join(lines)
+
+
+def send_via_aibot(ctx: dict[str, Any]) -> bool:
+    """
+    通过企业微信智能机器人长连接 API 主动推送。
+    流程：WebSocket 连接 → aibot_subscribe 订阅 → aibot_send_msg 推送 → 关闭。
+    """
+    if websocket is None:
+        log.error("缺少 websocket-client 库，请先 pip install websocket-client")
+        return False
+    if not (BOT_ID and BOT_SECRET and CHAT_ID):
+        log.error("缺少 BOT_ID / BOT_SECRET / CHAT_ID，无法使用智能机器人推送")
+        return False
+
+    md = build_aibot_markdown(ctx)
+    stop_ev = threading.Event()
+    try:
+        ws = websocket.create_connection(WS_URL, timeout=30)
+    except Exception as exc:
+        log.error("WebSocket 连接失败: %s", exc)
+        return False
+
+    hb = threading.Thread(target=_heartbeat, args=(ws, stop_ev), daemon=True)
+    hb.start()
+    try:
+        sub = _send_cmd(ws, "aibot_subscribe", {"bot_id": BOT_ID, "secret": BOT_SECRET})
+        if sub.get("errcode") != 0:
+            log.error("订阅失败: %s", sub)
+            return False
+        log.info("✅ 智能机器人订阅成功")
+
+        body = {
+            "chatid": CHAT_ID,
+            "chat_type": CHAT_TYPE,
+            "msgtype": "markdown",
+            "markdown": {"content": md},
+        }
+        resp = _send_cmd(ws, "aibot_send_msg", body)
+        ok = resp.get("errcode") == 0
+        if ok:
+            log.info("✅ 智能机器人推送成功")
+        else:
+            log.error("❌ 推送失败: %s", resp)
+        return ok
+    finally:
+        stop_ev.set()
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2010,12 +2162,7 @@ def main() -> int:
         write_html_files(html, ctx["date"])
 
     if MODE in ("push", "all"):
-        if PAGES_URL:
-            page_url = f"{PAGES_URL}/{ctx['date']:%Y-%m-%d}.html"
-            ok = send_news_card(ctx, page_url)
-        else:
-            log.warning("未设置 PAGES_URL，改用 markdown 推送作为降级方案")
-            ok = send_markdown_fallback(ctx)
+        ok = send_via_aibot(ctx)
         if not ok:
             return 1
 
