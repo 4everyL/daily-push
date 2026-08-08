@@ -62,9 +62,10 @@ jobs:
           echo "等待 Pages 部署生效..."
           sleep 90
 
-      - name: Push to WeChat Work (智能机器人)
+      - name: Push to WeChat Work (群机器人 Webhook 优先，智能机器人兜底)
         env:
           MODE: push
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           BOT_ID: ${{ secrets.BOT_ID }}
           BOT_SECRET: ${{ secrets.BOT_SECRET }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
