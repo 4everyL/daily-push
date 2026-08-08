@@ -1,9 +1,8 @@
 name: Daily Push
 
-# 每天北京时间 10:00 触发（UTC 02:00）
+# 每天北京时间 10:30 触发（UTC 02:30）
 on:
   schedule:
-    # 北京时间 10:30 = UTC 02:30
     - cron: "30 2 * * *"
   workflow_dispatch:     # 支持在 GitHub UI 手动触发
 
@@ -33,6 +32,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install dependencies
+        run: pip install websocket-client
+
       - name: Set Beijing Time
         run: |
           sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
@@ -60,9 +62,12 @@ jobs:
           echo "等待 Pages 部署生效..."
           sleep 90
 
-      - name: Push to WeChat Work
+      - name: Push to WeChat Work (智能机器人)
         env:
           MODE: push
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          BOT_ID: ${{ secrets.BOT_ID }}
+          BOT_SECRET: ${{ secrets.BOT_SECRET }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          CHAT_TYPE: "1"
           PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
         run: python daily_push.py
