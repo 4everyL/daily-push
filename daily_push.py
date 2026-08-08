@@ -7,10 +7,12 @@
 3. 推送企业微信图文卡片，点击跳转到 HTML 详情页
 
 环境变量：
-  BOT_ID       企业微信智能机器人 BotID（推送必填）
-  BOT_SECRET   智能机器人长连接专用 Secret（推送必填）
-  CHAT_ID      推送目标会话 ID：单聊填企业微信 userid，群聊填群 chatid
-  CHAT_TYPE    1=单聊（默认） / 2=群聊
+  WEBHOOK_URL  企业微信群机器人 Webhook 地址（推荐推送方式）：
+                 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<KEY>
+  BOT_ID       企业微信智能机器人 BotID（WebSocket 长连接，备用）
+  BOT_SECRET   智能机器人长连接专用 Secret（备用）
+  CHAT_ID      推送目标会话 ID（仅智能机器人模式）：单聊填 userid，群聊填群 chatid
+  CHAT_TYPE    1=单聊（默认） / 2=群聊（仅智能机器人模式）
   PAGES_URL    HTML 托管根地址（云端模式必填），如：
                  https://<user>.github.io/<repo>
   MODE         html | push | all（默认 all）
@@ -59,6 +61,8 @@ CHAT_ID = os.environ.get("CHAT_ID") or ""            # 单聊填企业微信 use
 CHAT_TYPE = int(os.environ.get("CHAT_TYPE") or "1")  # 1=单聊（默认）, 2=群聊
 PAGES_URL = (os.environ.get("PAGES_URL") or "").rstrip("/")
 MODE = os.environ.get("MODE", "all").lower()
+# 群机器人 Webhook 地址（推荐推送方式）：https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<KEY>
+WEBHOOK_URL = (os.environ.get("WEBHOOK_URL") or "").strip()
 
 FALLBACK_COVER = (
     "https://images.unsplash.com/photo-1504608524841-42fe6f032b4b"
@@ -2085,8 +2089,37 @@ def build_aibot_markdown(ctx: dict[str, Any]) -> str:
         for t in ctx["travels"][:2]:
             lines.append(f"- **{t['name']}**｜{t.get('season', '')}")
 
-    lines.append("\n> 完整版见网页 https://4everyl.github.io/daily-push/")
+    page = PAGES_URL or "https://4everyl.github.io/daily-push/"
+    lines.append(f"\n> 完整版见网页 {page}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 企业微信群机器人（Webhook）主动推送
+# ---------------------------------------------------------------------------
+
+def send_via_webhook(ctx: dict[str, Any]) -> bool:
+    """
+    通过企业微信群机器人 Webhook 推送（msgtype=markdown）。
+    比智能机器人省心：不需要先和用户互动，也不会被 846607 拦截。
+    群机器人 Webhook 地址格式：
+        https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<KEY>
+    """
+    if not WEBHOOK_URL:
+        log.error("未配置 WEBHOOK_URL，无法使用群机器人推送")
+        return False
+    md = build_aibot_markdown(ctx)
+    payload = {"msgtype": "markdown", "markdown": {"content": md}}
+    try:
+        resp = http_post_json(WEBHOOK_URL, payload)
+    except Exception as exc:
+        log.error("Webhook 请求失败: %s", exc)
+        return False
+    if resp.get("errcode") == 0:
+        log.info("✅ 群机器人推送成功")
+        return True
+    log.error("❌ 群机器人推送失败: %s", resp)
+    return False
 
 
 def send_via_aibot(ctx: dict[str, Any]) -> bool:
@@ -2162,7 +2195,13 @@ def main() -> int:
         write_html_files(html, ctx["date"])
 
     if MODE in ("push", "all"):
-        ok = send_via_aibot(ctx)
+        if WEBHOOK_URL:
+            ok = send_via_webhook(ctx)
+        elif BOT_ID and BOT_SECRET and CHAT_ID:
+            ok = send_via_aibot(ctx)
+        else:
+            log.error("未配置任何推送方式（WEBHOOK_URL 或 BOT_ID/BOT_SECRET/CHAT_ID）")
+            ok = False
         if not ok:
             return 1
 
