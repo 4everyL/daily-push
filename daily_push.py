@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html as html_mod
 import json
 import logging
@@ -49,6 +51,10 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
 )
+
+# uuhb.cn 每日60秒早报图（PNG 长图，稳定不限流）
+UUHB_60S_IMAGE_URL = "https://v1.uuhb.cn/v1/60s/image"
+IMAGE_MAX_BYTES = 2 * 1024 * 1024  # 企业微信图片消息上限：2MB
 
 ROOT = Path(__file__).resolve().parent
 DOCS_DIR = ROOT / "docs"
@@ -84,19 +90,54 @@ log = logging.getLogger("daily_push")
 # HTTP
 # ---------------------------------------------------------------------------
 
-def http_get_json(path: str) -> dict[str, Any] | None:
+def http_get_json(path: str, retries: int = 2) -> dict[str, Any] | None:
+    """带指数退避重试的 GET，降低 CI 环境偶发 429/500 导致整段空白。"""
     url = f"{BASE_API}{path}"
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if payload.get("code") != 200:
+                log.warning("API %s code=%s", path, payload.get("code"))
+                return None
+            return payload.get("data")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_exc = exc
+            wait = 2 ** attempt
+            log.warning("API %s attempt %d/%d failed: %s", path, attempt + 1, retries + 1, exc)
+            if attempt < retries:
+                log.info("Retrying %s in %ds...", path, wait)
+                time.sleep(wait)
+    log.warning("API %s all attempts failed: %s", path, last_exc)
+    return None
+
+
+def download_image(url: str, max_bytes: int = IMAGE_MAX_BYTES) -> bytes | None:
+    """下载图片并校验大小与格式；失败返回 None。"""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        if payload.get("code") != 200:
-            log.warning("API %s code=%s", path, payload.get("code"))
+            data = resp.read()
+        if len(data) > max_bytes:
+            log.warning("图片超过大小限制: %d bytes (max %d)", len(data), max_bytes)
             return None
-        return payload.get("data")
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        log.warning("API %s failed: %s", path, exc)
+        if not data.startswith(b"\x89PNG"):
+            log.warning("图片不是 PNG, 前8字节: %s", data[:8])
+            return None
+        log.info("✅ 图片下载成功: %d bytes", len(data))
+        return data
+    except (urllib.error.URLError, TimeoutError) as exc:
+        log.warning("图片下载失败: %s", exc)
         return None
+
+
+def image_payload(image_data: bytes) -> dict[str, Any]:
+    """生成企业微信图片消息体（base64 + md5）。"""
+    b64 = base64.b64encode(image_data).decode("utf-8")
+    md5_hash = hashlib.md5(image_data).hexdigest()
+    return {"msgtype": "image", "image": {"base64": b64, "md5": md5_hash}}
 
 
 def http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2091,12 +2132,28 @@ def build_aibot_markdown(ctx: dict[str, Any]) -> str:
 
     page = PAGES_URL or "https://4everyl.github.io/daily-push/"
     lines.append(f"\n> 完整版见网页 {page}")
+    lines.append("\n> 📰 每日60秒早报请查看下一条图片消息")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # 企业微信群机器人（Webhook）主动推送
 # ---------------------------------------------------------------------------
+
+def send_image_via_webhook(image_data: bytes) -> bool:
+    """通过群机器人 Webhook 发送图片消息。"""
+    if not WEBHOOK_URL:
+        return False
+    try:
+        resp = http_post_json(WEBHOOK_URL, image_payload(image_data))
+        if resp.get("errcode") == 0:
+            log.info("✅ 群机器人图片推送成功")
+            return True
+        log.error("❌ 群机器人图片推送失败: %s", resp)
+    except Exception as exc:
+        log.error("群机器人图片发送异常: %s", exc)
+    return False
+
 
 def send_via_webhook(ctx: dict[str, Any]) -> bool:
     """
@@ -2122,10 +2179,11 @@ def send_via_webhook(ctx: dict[str, Any]) -> bool:
     return False
 
 
-def send_via_aibot(ctx: dict[str, Any]) -> bool:
+def send_via_aibot(ctx: dict[str, Any], image_data: bytes | None = None) -> bool:
     """
     通过企业微信智能机器人长连接 API 主动推送。
     流程：WebSocket 连接 → aibot_subscribe 订阅 → aibot_send_msg 推送 → 关闭。
+    如传入 image_data，推送完 markdown 后继续发送图片消息。
     """
     if websocket is None:
         log.error("缺少 websocket-client 库，请先 pip install websocket-client")
@@ -2162,8 +2220,21 @@ def send_via_aibot(ctx: dict[str, Any]) -> bool:
         if ok:
             log.info("✅ 智能机器人推送成功")
         else:
-            log.error("❌ 推送失败: %s", resp)
-        return ok
+            log.error("❌ 智能机器人推送失败: %s", resp)
+            return False
+
+        if image_data:
+            img_body = {
+                "chatid": CHAT_ID,
+                "chat_type": CHAT_TYPE,
+                **image_payload(image_data),
+            }
+            resp2 = _send_cmd(ws, "aibot_send_msg", img_body)
+            if resp2.get("errcode") == 0:
+                log.info("✅ 智能机器人图片推送成功")
+            else:
+                log.error("❌ 智能机器人图片推送失败: %s", resp2)
+        return True
     finally:
         stop_ev.set()
         try:
@@ -2190,6 +2261,9 @@ def main() -> int:
         "news": get_daily_news(),
     }
 
+    # 下载 uuhb.cn 每日60秒早报图（独立图片消息，不受 viki 限流影响）
+    image_data = download_image(UUHB_60S_IMAGE_URL)
+
     if MODE in ("html", "all"):
         html = render_html(ctx)
         write_html_files(html, ctx["date"])
@@ -2197,8 +2271,10 @@ def main() -> int:
     if MODE in ("push", "all"):
         if WEBHOOK_URL:
             ok = send_via_webhook(ctx)
+            if ok and image_data:
+                send_image_via_webhook(image_data)
         elif BOT_ID and BOT_SECRET and CHAT_ID:
-            ok = send_via_aibot(ctx)
+            ok = send_via_aibot(ctx, image_data=image_data)
         else:
             log.error("未配置任何推送方式（WEBHOOK_URL 或 BOT_ID/BOT_SECRET/CHAT_ID）")
             ok = False
