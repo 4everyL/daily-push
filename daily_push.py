@@ -134,10 +134,27 @@ def download_image(url: str, max_bytes: int = IMAGE_MAX_BYTES) -> bytes | None:
 
 
 def image_payload(image_data: bytes) -> dict[str, Any]:
-    """生成企业微信图片消息体（base64 + md5）。"""
+    """生成企业微信图片消息体（base64 + md5），群机器人 Webhook 专用。"""
     b64 = base64.b64encode(image_data).decode("utf-8")
     md5_hash = hashlib.md5(image_data).hexdigest()
     return {"msgtype": "image", "image": {"base64": b64, "md5": md5_hash}}
+
+
+def news_payload(title: str, description: str, url: str, picurl: str) -> dict[str, Any]:
+    """生成企业微信图文消息体，智能机器人单聊/群聊可用（picurl 用外部图片地址）。"""
+    return {
+        "msgtype": "news",
+        "news": {
+            "articles": [
+                {
+                    "title": title,
+                    "description": description,
+                    "url": url,
+                    "picurl": picurl,
+                }
+            ]
+        },
+    }
 
 
 def http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2179,11 +2196,11 @@ def send_via_webhook(ctx: dict[str, Any]) -> bool:
     return False
 
 
-def send_via_aibot(ctx: dict[str, Any], image_data: bytes | None = None) -> bool:
+def send_via_aibot(ctx: dict[str, Any], image_url: str | None = None) -> bool:
     """
     通过企业微信智能机器人长连接 API 主动推送。
     流程：WebSocket 连接 → aibot_subscribe 订阅 → aibot_send_msg 推送 → 关闭。
-    如传入 image_data，推送完 markdown 后继续发送图片消息。
+    如传入 image_url，推送完 markdown 后继续发送一条图文消息（封面即早报图）。
     """
     if websocket is None:
         log.error("缺少 websocket-client 库，请先 pip install websocket-client")
@@ -2223,17 +2240,22 @@ def send_via_aibot(ctx: dict[str, Any], image_data: bytes | None = None) -> bool
             log.error("❌ 智能机器人推送失败: %s", resp)
             return False
 
-        if image_data:
-            img_body = {
+        if image_url:
+            news_body = {
                 "chatid": CHAT_ID,
                 "chat_type": CHAT_TYPE,
-                **image_payload(image_data),
+                **news_payload(
+                    title="📰 每日60秒早报",
+                    description="点击卡片查看今日新闻详情",
+                    url=image_url,
+                    picurl=image_url,
+                ),
             }
-            resp2 = _send_cmd(ws, "aibot_send_msg", img_body)
+            resp2 = _send_cmd(ws, "aibot_send_msg", news_body, timeout=30)
             if resp2.get("errcode") == 0:
-                log.info("✅ 智能机器人图片推送成功")
+                log.info("✅ 智能机器人图文消息推送成功")
             else:
-                log.error("❌ 智能机器人图片推送失败: %s", resp2)
+                log.error("❌ 智能机器人图文消息推送失败: %s", resp2)
         return True
     finally:
         stop_ev.set()
@@ -2274,7 +2296,7 @@ def main() -> int:
             if ok and image_data:
                 send_image_via_webhook(image_data)
         elif BOT_ID and BOT_SECRET and CHAT_ID:
-            ok = send_via_aibot(ctx, image_data=image_data)
+            ok = send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
         else:
             log.error("未配置任何推送方式（WEBHOOK_URL 或 BOT_ID/BOT_SECRET/CHAT_ID）")
             ok = False
