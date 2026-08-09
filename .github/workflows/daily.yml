@@ -78,4 +78,14 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           CHAT_TYPE: "1"
           PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          # 早安 / 天气 / 恋爱小情书（合并自 4everyL/daily，原微信公众号测试号推送）
+          HEFENG_KEY: ${{ secrets.HEFENG_KEY }}
+          CITY: ${{ secrets.CITY }}
+          TIAN_KEY: ${{ secrets.TIAN_KEY }}
+          START_DATE: ${{ secrets.START_DATE }}
+          JINGJING_BIRTHDAY: ${{ secrets.JINGJING_BIRTHDAY }}
+          PIPI_TEXT: ${{ secrets.PIPI_TEXT }}
+          LUCKY_TEXT: ${{ secrets.LUCKY_TEXT }}
+          LIZHI_TEXT: ${{ secrets.LIZHI_TEXT }}
+          TIANQI_TEXT: ${{ secrets.TIANQI_TEXT }}
         run: python daily_push.py
