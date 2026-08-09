@@ -9,6 +9,10 @@
 环境变量：
   WEBHOOK_URL  企业微信群机器人 Webhook 地址（推荐推送方式）：
                  https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<KEY>
+  CORPID       企业微信企业 ID（自建应用推送必填）
+  CORPSECRET   自建应用 Secret（AgentId 对应的 Secret）
+  AGENTID      自建应用 AgentId（数字，如 1000002）
+  TOUSER       接收人企业微信 userid（默认复用 CHAT_ID）
   BOT_ID       企业微信智能机器人 BotID（WebSocket 长连接，备用）
   BOT_SECRET   智能机器人长连接专用 Secret（备用）
   CHAT_ID      推送目标会话 ID（仅智能机器人模式）：单聊填 userid，群聊填群 chatid
@@ -65,6 +69,15 @@ BOT_ID = os.environ.get("BOT_ID") or ""
 BOT_SECRET = os.environ.get("BOT_SECRET") or ""
 CHAT_ID = os.environ.get("CHAT_ID") or ""            # 单聊填企业微信 userid；群聊填群 chatid
 CHAT_TYPE = int(os.environ.get("CHAT_TYPE") or "1")  # 1=单聊（默认）, 2=群聊
+
+# 企业微信自建应用（corp app）推送凭证 —— 通过仓库 Secrets 配置，不硬编码。
+# 相比智能机器人，自建应用无需"先互动"，且原生支持 markdown / news 图文。
+CORPID = os.environ.get("CORPID") or ""
+CORPSECRET = os.environ.get("CORPSECRET") or ""
+AGENTID = int(os.environ.get("AGENTID") or "0")
+# 接收人：企业微信 userid（默认复用 CHAT_ID，即单聊推送目标）
+TOUSER = os.environ.get("TOUSER") or CHAT_ID
+
 PAGES_URL = (os.environ.get("PAGES_URL") or "").rstrip("/")
 MODE = os.environ.get("MODE", "all").lower()
 # 群机器人 Webhook 地址（推荐推送方式）：https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<KEY>
@@ -2287,6 +2300,103 @@ def send_via_aibot(ctx: dict[str, Any], image_url: str | None = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 企业微信自建应用（corp app）主动推送
+# ---------------------------------------------------------------------------
+
+WX_API = "https://qyapi.weixin.qq.com/cgi-bin"
+_access_token_cache: dict[str, Any] = {"token": None, "expire": 0.0}
+
+
+def get_access_token() -> str | None:
+    """获取企业微信应用 access_token（带缓存，7200s 有效期）。"""
+    if not (CORPID and CORPSECRET):
+        log.error("缺少 CORPID / CORPSECRET，无法使用企业微信应用推送")
+        return None
+    now = time.time()
+    if _access_token_cache["token"] and now < _access_token_cache["expire"]:
+        return _access_token_cache["token"]
+    url = f"{WX_API}/gettoken?corpid={CORPID}&corpsecret={CORPSECRET}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("errcode") != 0:
+            log.error("获取 access_token 失败: %s", data)
+            return None
+        _access_token_cache["token"] = data["access_token"]
+        _access_token_cache["expire"] = now + float(data.get("expires_in", 7200)) - 200
+        log.info("✅ 获取 access_token 成功")
+        return data["access_token"]
+    except Exception as exc:
+        log.error("获取 access_token 异常: %s", exc)
+        return None
+
+
+def send_via_app(ctx: dict[str, Any], image_url: str | None = None) -> bool:
+    """
+    通过企业微信自建应用（corp app）主动推送。
+    流程：gettoken → message/send(markdown) → message/send(news 图文，封面即早报图)。
+    自建应用无需"先互动"，也不受 846607 限制；原生支持 markdown / news。
+    早报图用 news 图文（picurl 即图片链接），无需上传 base64 / media_id。
+    """
+    if not (CORPID and CORPSECRET and AGENTID and TOUSER):
+        log.error("缺少 CORPID / CORPSECRET / AGENTID / TOUSER，无法使用企业微信应用推送")
+        return False
+
+    token = get_access_token()
+    if not token:
+        return False
+
+    md = build_aibot_markdown(ctx)
+    # 企业微信 markdown 消息 content 上限 4096 字节，超长截断保护
+    if len(md.encode("utf-8")) > 4096:
+        md = md.encode("utf-8")[:4090].decode("utf-8", "ignore")
+        md += "\n> …（内容过长已截断）"
+
+    body = {
+        "touser": TOUSER,
+        "msgtype": "markdown",
+        "agentid": AGENTID,
+        "markdown": {"content": md},
+    }
+    try:
+        resp = http_post_json(f"{WX_API}/message/send?access_token={token}", body)
+    except Exception as exc:
+        log.error("企业微信应用推送请求失败: %s", exc)
+        return False
+    if resp.get("errcode") != 0:
+        log.error("❌ 企业微信应用推送失败: %s", resp)
+        return False
+    log.info("✅ 企业微信应用推送成功")
+
+    if image_url:
+        news_body = {
+            "touser": TOUSER,
+            "msgtype": "news",
+            "agentid": AGENTID,
+            "news": {
+                "articles": [
+                    {
+                        "title": "📰 每日60秒早报",
+                        "description": "点击查看今日新闻速览长图",
+                        "url": image_url,
+                        "picurl": image_url,
+                    }
+                ]
+            },
+        }
+        try:
+            r2 = http_post_json(f"{WX_API}/message/send?access_token={token}", news_body)
+            if r2.get("errcode") == 0:
+                log.info("✅ 企业微信应用早报图推送成功")
+            else:
+                log.error("❌ 企业微信应用早报图推送失败: %s", r2)
+        except Exception as exc:
+            log.error("企业微信应用早报图请求失败: %s", exc)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2316,10 +2426,15 @@ def main() -> int:
             ok = send_via_webhook(ctx)
             if ok and image_data:
                 send_image_via_webhook(image_data)
+        elif CORPID and CORPSECRET and AGENTID and TOUSER:
+            ok = send_via_app(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
         elif BOT_ID and BOT_SECRET and CHAT_ID:
             ok = send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
         else:
-            log.error("未配置任何推送方式（WEBHOOK_URL 或 BOT_ID/BOT_SECRET/CHAT_ID）")
+            log.error(
+                "未配置任何推送方式（WEBHOOK_URL / 企业微信应用 CORPID+CORPSECRET+AGENTID+TOUSER / "
+                "智能机器人 BOT_ID+BOT_SECRET+CHAT_ID）"
+            )
             ok = False
         if not ok:
             return 1
