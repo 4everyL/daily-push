@@ -141,7 +141,7 @@ def image_payload(image_data: bytes) -> dict[str, Any]:
 
 
 def news_payload(title: str, description: str, url: str, picurl: str) -> dict[str, Any]:
-    """生成企业微信图文消息体，智能机器人单聊/群聊可用（picurl 用外部图片地址）。"""
+    """生成企业微信图文消息体（群机器人 Webhook 可用）。"""
     return {
         "msgtype": "news",
         "news": {
@@ -153,6 +153,31 @@ def news_payload(title: str, description: str, url: str, picurl: str) -> dict[st
                     "picurl": picurl,
                 }
             ]
+        },
+    }
+
+
+def template_card_payload(image_url: str, date_str: str) -> dict[str, Any]:
+    """生成企业微信模板卡片（news_notice），智能机器人主动发送可用，封面用外部图片 URL。"""
+    return {
+        "msgtype": "template_card",
+        "template_card": {
+            "card_type": "news_notice",
+            "source": {
+                "desc": "每日60秒早报",
+            },
+            "main_title": {
+                "title": "📰 每日60秒早报",
+                "desc": date_str,
+            },
+            "card_image": {
+                "url": image_url,
+                "aspect_ratio": 0.69,
+            },
+            "card_action": {
+                "type": 1,
+                "url": image_url,
+            },
         },
     }
 
@@ -2200,7 +2225,7 @@ def send_via_aibot(ctx: dict[str, Any], image_url: str | None = None) -> bool:
     """
     通过企业微信智能机器人长连接 API 主动推送。
     流程：WebSocket 连接 → aibot_subscribe 订阅 → aibot_send_msg 推送 → 关闭。
-    如传入 image_url，推送完 markdown 后继续发送一条图文消息（封面即早报图）。
+    如传入 image_url，推送完 markdown 后继续发送一条模板卡片（封面即早报图）。
     """
     if websocket is None:
         log.error("缺少 websocket-client 库，请先 pip install websocket-client")
@@ -2241,21 +2266,17 @@ def send_via_aibot(ctx: dict[str, Any], image_url: str | None = None) -> bool:
             return False
 
         if image_url:
-            news_body = {
+            date: datetime = ctx["date"]
+            card_body = {
                 "chatid": CHAT_ID,
                 "chat_type": CHAT_TYPE,
-                **news_payload(
-                    title="📰 每日60秒早报",
-                    description="点击卡片查看今日新闻详情",
-                    url=image_url,
-                    picurl=image_url,
-                ),
+                **template_card_payload(image_url, f"{date:%m月%d日}"),
             }
-            resp2 = _send_cmd(ws, "aibot_send_msg", news_body, timeout=30)
+            resp2 = _send_cmd(ws, "aibot_send_msg", card_body, timeout=30)
             if resp2.get("errcode") == 0:
-                log.info("✅ 智能机器人图文消息推送成功")
+                log.info("✅ 智能机器人模板卡片推送成功")
             else:
-                log.error("❌ 智能机器人图文消息推送失败: %s", resp2)
+                log.error("❌ 智能机器人模板卡片推送失败: %s", resp2)
         return True
     finally:
         stop_ev.set()
