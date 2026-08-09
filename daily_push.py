@@ -153,6 +153,40 @@ def image_payload(image_data: bytes) -> dict[str, Any]:
     return {"msgtype": "image", "image": {"base64": b64, "md5": md5_hash}}
 
 
+def upload_media_to_wechat(token: str, media_type: str, filename: str, data: bytes) -> str | None:
+    """上传临时素材到企业微信，返回 media_id；失败返回 None。"""
+    boundary = f"----Boundary{uuid.uuid4().hex[:16]}"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="media"; filename="{filename}"\r\n'
+        f"Content-Type: image/png\r\n\r\n"
+    ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{WX_API}/media/upload?access_token={token}&type={media_type}",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT * 2) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        if result.get("errcode") == 0:
+            return result.get("media_id")
+        log.error("上传临时素材失败: %s", result)
+    except Exception as exc:
+        log.error("上传临时素材异常: %s", exc)
+    return None
+
+
+def image_msg_payload(media_id: str) -> dict[str, Any]:
+    """生成企业微信自建应用 image 消息体（需先上传素材拿到 media_id）。"""
+    return {"msgtype": "image", "image": {"media_id": media_id}}
+
+
 def news_payload(title: str, description: str, url: str, picurl: str) -> dict[str, Any]:
     """生成企业微信图文消息体（群机器人 Webhook 可用）。"""
     return {
@@ -2191,6 +2225,65 @@ def build_aibot_markdown(ctx: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_app_text(ctx: dict[str, Any]) -> str:
+    """
+    拼一条纯文本摘要，供企业微信自建应用 text 消息使用。
+    个人微信对自建应用的 markdown / news / template_card 不兼容（会提示
+    “暂不支持此消息类型”），但完全支持 text + image（图片消息）。
+    text 消息 content 上限 2048 字节，需做截断保护。
+    """
+    date: datetime = ctx["date"]
+    weekday = "一二三四五六日"[date.weekday()]
+    lines = [f"📬 今日精选 · {date:%m月%d日} 星期{weekday}", ""]
+
+    hot = ctx.get("hot") or {}
+    lines.append("🔥 热搜")
+    n = 0
+    for cat, items in hot.items():
+        for m in items[:3]:
+            lines.append(f"- {m['title']}")
+            n += 1
+            if n >= 8:
+                break
+        if n >= 8:
+            break
+
+    jokes = ctx.get("jokes") or []
+    if jokes:
+        lines.append("")
+        lines.append("😄 冷笑话")
+        lines.append(f"- {jokes[0]}")
+
+    media = ctx.get("media") or {}
+    movies = media.get("movies") or []
+    musics = media.get("musics") or []
+    if movies or musics:
+        lines.append("")
+        lines.append("🎬 影音")
+        for m in movies[:2]:
+            lines.append(f"- 《{m['title']}》· {m['subtitle']}")
+        for m in musics[:2]:
+            lines.append(f"- 🎵 {m['title']} - {m['subtitle']}")
+
+    if ctx.get("travels"):
+        lines.append("")
+        lines.append("🧳 旅游推荐")
+        for t in ctx["travels"][:2]:
+            lines.append(f"- {t['name']}｜{t.get('season', '')}")
+
+    page = PAGES_URL or "https://4everyl.github.io/daily-push/"
+    lines.append("")
+    lines.append(f"完整版见网页 {page}")
+    lines.append("📰 每日60秒早报请查看下一条图片消息")
+
+    text = "\n".join(lines)
+    # text 消息 content 上限 2048 字节，超限截断保护
+    if len(text.encode("utf-8")) > 2048:
+        text = text.encode("utf-8")[:2040].decode("utf-8", "ignore")
+        text += "\n…（内容过长已截断）"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # 企业微信群机器人（Webhook）主动推送
 # ---------------------------------------------------------------------------
@@ -2332,12 +2425,15 @@ def get_access_token() -> str | None:
         return None
 
 
-def send_via_app(ctx: dict[str, Any], image_url: str | None = None) -> bool:
+def send_via_app(ctx: dict[str, Any], image_data: bytes | None = None) -> bool:
     """
     通过企业微信自建应用（corp app）主动推送。
-    流程：gettoken → message/send(markdown) → message/send(news 图文，封面即早报图)。
-    自建应用无需"先互动"，也不受 846607 限制；原生支持 markdown / news。
-    早报图用 news 图文（picurl 即图片链接），无需上传 base64 / media_id。
+    流程：gettoken → message/send(text 纯文本) → 上传早报图素材 → message/send(image 图片)。
+
+    重要兼容性说明（修复个人微信“暂不支持此消息类型”提示）：
+    个人微信对自建应用发来的 markdown / news / template_card 均不兼容，会提示
+    “暂不支持此消息类型，请在企业微信中查看”。个人微信仅完整支持 text 纯文本
+    与 image 图片消息。因此这里改用 text + image，个人微信和企业微信 App 都能正常查看。
     """
     if not (CORPID and CORPSECRET and AGENTID and TOUSER):
         log.error("缺少 CORPID / CORPSECRET / AGENTID / TOUSER，无法使用企业微信应用推送")
@@ -2347,17 +2443,13 @@ def send_via_app(ctx: dict[str, Any], image_url: str | None = None) -> bool:
     if not token:
         return False
 
-    md = build_aibot_markdown(ctx)
-    # 企业微信 markdown 消息 content 上限 4096 字节，超长截断保护
-    if len(md.encode("utf-8")) > 4096:
-        md = md.encode("utf-8")[:4090].decode("utf-8", "ignore")
-        md += "\n> …（内容过长已截断）"
-
+    # 1) 纯文本摘要（个人微信完全支持）
+    text = build_app_text(ctx)
     body = {
         "touser": TOUSER,
-        "msgtype": "markdown",
+        "msgtype": "text",
         "agentid": AGENTID,
-        "markdown": {"content": md},
+        "text": {"content": text},
     }
     try:
         resp = http_post_json(f"{WX_API}/message/send?access_token={token}", body)
@@ -2367,32 +2459,27 @@ def send_via_app(ctx: dict[str, Any], image_url: str | None = None) -> bool:
     if resp.get("errcode") != 0:
         log.error("❌ 企业微信应用推送失败: %s", resp)
         return False
-    log.info("✅ 企业微信应用推送成功")
+    log.info("✅ 企业微信应用文本推送成功")
 
-    if image_url:
-        news_body = {
-            "touser": TOUSER,
-            "msgtype": "news",
-            "agentid": AGENTID,
-            "news": {
-                "articles": [
-                    {
-                        "title": "📰 每日60秒早报",
-                        "description": "点击查看今日新闻速览长图",
-                        "url": image_url,
-                        "picurl": image_url,
-                    }
-                ]
-            },
-        }
-        try:
-            r2 = http_post_json(f"{WX_API}/message/send?access_token={token}", news_body)
-            if r2.get("errcode") == 0:
-                log.info("✅ 企业微信应用早报图推送成功")
-            else:
-                log.error("❌ 企业微信应用早报图推送失败: %s", r2)
-        except Exception as exc:
-            log.error("企业微信应用早报图请求失败: %s", exc)
+    # 2) 早报图：先上传临时素材拿 media_id，再发 image 消息
+    if image_data:
+        media_id = upload_media_to_wechat(token, "image", "60s.png", image_data)
+        if media_id:
+            img_body = {
+                "touser": TOUSER,
+                "agentid": AGENTID,
+                **image_msg_payload(media_id),
+            }
+            try:
+                r2 = http_post_json(f"{WX_API}/message/send?access_token={token}", img_body)
+                if r2.get("errcode") == 0:
+                    log.info("✅ 企业微信应用早报图推送成功")
+                else:
+                    log.error("❌ 企业微信应用早报图推送失败: %s", r2)
+            except Exception as exc:
+                log.error("企业微信应用早报图请求失败: %s", exc)
+        else:
+            log.warning("⚠️ 早报图素材上传失败，跳过图片消息（文本已成功送达）")
     return True
 
 
@@ -2427,7 +2514,7 @@ def main() -> int:
             if ok and image_data:
                 send_image_via_webhook(image_data)
         elif CORPID and CORPSECRET and AGENTID and TOUSER:
-            ok = send_via_app(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
+            ok = send_via_app(ctx, image_data=image_data)
         elif BOT_ID and BOT_SECRET and CHAT_ID:
             ok = send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
         else:
