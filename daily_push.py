@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import html as html_mod
 import json
@@ -39,7 +40,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,18 @@ PAGES_URL = (os.environ.get("PAGES_URL") or "").rstrip("/")
 MODE = os.environ.get("MODE", "all").lower()
 # 群机器人 Webhook 地址（推荐推送方式）：https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<KEY>
 WEBHOOK_URL = (os.environ.get("WEBHOOK_URL") or "").strip()
+
+# 早安 / 天气 / 恋爱小情书（合并自 4everyL/daily，原微信公众号测试号推送）
+HEFENG_KEY = os.environ.get("HEFENG_KEY") or ""            # 和风天气 API key
+CITY = os.environ.get("CITY") or "福州"                     # 城市中文名
+TIAN_KEY = os.environ.get("TIAN_KEY") or ""                # 天行数据 API key（彩虹屁/情话）
+START_DATE = os.environ.get("START_DATE") or ""             # 恋爱开始日期 YYYY-MM-DD -> love_day
+JINGJING_BIRTHDAY = os.environ.get("JINGJING_BIRTHDAY") or ""  # 婧婧生日 MM-DD -> birthday2
+# 自定义文案覆盖（可选，缺省走天行 API / 兜底）
+PIPI_TEXT = os.environ.get("PIPI_TEXT") or ""
+LUCKY_TEXT = os.environ.get("LUCKY_TEXT") or ""
+LIZHI_TEXT = os.environ.get("LIZHI_TEXT") or ""
+TIANQI_TEXT = os.environ.get("TIANQI_TEXT") or ""
 
 FALLBACK_COVER = (
     "https://images.unsplash.com/photo-1504608524841-42fe6f032b4b"
@@ -2478,8 +2491,187 @@ def send_via_app(ctx: dict[str, Any], image_data: bytes | None = None) -> bool:
                     log.error("❌ 企业微信应用早报图推送失败: %s", r2)
             except Exception as exc:
                 log.error("企业微信应用早报图请求失败: %s", exc)
-        else:
-            log.warning("⚠️ 早报图素材上传失败，跳过图片消息（文本已成功送达）")
+    else:
+        log.warning("⚠️ 早报图素材上传失败，跳过图片消息（文本已成功送达）")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 早安 / 天气 / 恋爱小情书（合并自 4everyL/daily，原微信公众号测试号推送）
+# ---------------------------------------------------------------------------
+
+HEFENG_GEO = "https://geoapi.qweather.com/v2/city/lookup"
+HEFENG_3D = "https://devapi.qweather.com/v7/weather/3d"
+HEFENG_NOW = "https://devapi.qweather.com/v7/weather/now"
+TIAN_BASE = "https://apis.tianapi.com"
+
+
+def _decode_gz(resp) -> dict[str, Any]:
+    raw = resp.read()
+    if resp.headers.get("Content-Encoding") == "gzip" or raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
+def _http_get_json(url: str, timeout: int = 15) -> dict[str, Any]:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT, "Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return _decode_gz(r)
+
+
+def hefeng_lookup(key: str, city: str):
+    """和风天气城市查询，返回 (location_id, 展示名)。"""
+    q = urllib.parse.urlencode({"location": city, "key": key, "range": "cn"})
+    d = _http_get_json(f"{HEFENG_GEO}?{q}")
+    if d.get("code") != "200" or not d.get("location"):
+        raise RuntimeError(f"城市查询失败: {city} (code={d.get('code')})")
+    loc = d["location"][0]
+    adm1 = loc.get("adm1", "").replace("省", "").replace("市", "")
+    name = loc["name"]
+    full = f"{adm1} {name}" if adm1 and adm1 != name else name
+    return loc["id"], full
+
+
+def hefeng_weather(key: str, lid: str):
+    """和风天气：返回 (今日预报 dict, 实时天气 dict|None)。"""
+    q = urllib.parse.urlencode({"location": lid, "key": key})
+    d3 = _http_get_json(f"{HEFENG_3D}?{q}")
+    if d3.get("code") != "200":
+        raise RuntimeError(f"天气预报查询失败: code={d3.get('code')}")
+    today = d3["daily"][0]
+    now = _http_get_json(f"{HEFENG_NOW}?{q}")
+    now_data = now["now"] if now.get("code") == "200" else None
+    return today, now_data
+
+
+def tianapi_text(name: str, key: str) -> str | None:
+    """调用天行接口抽取一句文本；失败/未配置返回 None（由调用方兜底）。"""
+    if not key:
+        return None
+    url = f"{TIAN_BASE}/{name}/index?key={urllib.parse.quote(key)}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": USER_AGENT, "Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = _decode_gz(r)
+    except Exception as e:
+        log.warning("天行接口 %s 请求异常: %s", name, e)
+        return None
+    if d.get("code") != 200:
+        log.warning("天行接口 %s 返回 code=%s msg=%s", name, d.get("code"), d.get("msg"))
+        return None
+    res = d.get("result")
+    if isinstance(res, dict):
+        for k in ("content", "word", "saying", "en", "zh"):
+            if res.get(k):
+                return str(res[k])
+    if isinstance(res, list) and res:
+        item = res[0]
+        if isinstance(item, dict):
+            for k in ("content", "word", "saying"):
+                if item.get(k):
+                    return str(item[k])
+        return str(item)
+    return None
+
+
+def days_since(date_str: str) -> int:
+    start = datetime.strptime(date_str, "%Y-%m-%d").date()
+    return (date.today() - start).days + 1
+
+
+def days_until(mmdd: str) -> int:
+    m, d = map(int, mmdd.split("-"))
+    today = date.today()
+    cand = date(today.year, m, d)
+    if cand < today:
+        cand = date(today.year + 1, m, d)
+    return (cand - today).days
+
+
+def tips_for(today: dict[str, Any]) -> str:
+    text = today.get("textDay", "")
+    try:
+        pop_i = int(today.get("pop", ""))
+    except (ValueError, TypeError):
+        pop_i = 0
+    if pop_i >= 50:
+        return "降雨概率较高，记得带伞 ☔"
+    if "雨" in text:
+        return "今天可能有雨，出门带伞"
+    if "雪" in text:
+        return "有雪，注意保暖防滑"
+    if "晴" in text:
+        return "天气晴好，适合出门走走"
+    return "天气尚可，注意补水"
+
+
+def build_morning_text() -> str | None:
+    """生成早安/天气/恋爱小情书纯文本。缺少必填项时返回 None（不发送）。"""
+    if not (HEFENG_KEY and START_DATE and JINGJING_BIRTHDAY):
+        return None
+    try:
+        lid, city_full = hefeng_lookup(HEFENG_KEY, CITY)
+        today, now_data = hefeng_weather(HEFENG_KEY, lid)
+    except Exception as e:
+        log.warning("天气获取失败，跳过早安消息: %s", e)
+        return None
+
+    love = str(days_since(START_DATE))
+    b2 = str(days_until(JINGJING_BIRTHDAY))
+    now = datetime.now()
+    week = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][now.weekday()]
+    date_str = f"{now.year}年{now.month}月{now.day}日 {week}"
+
+    weather_text = today.get("textDay", "")
+    if now_data and now_data.get("text"):
+        weather_text = now_data["text"]
+    temp_min = today.get("tempMin", "")
+    temp_max = today.get("tempMax", "")
+    tip = tips_for(today)
+
+    pipi = (PIPI_TEXT or LUCKY_TEXT or LIZHI_TEXT or TIANQI_TEXT
+            or tianapi_text("caihongpi", TIAN_KEY)
+            or "你今天也要开开心心的呀~")
+
+    lines = [
+        f"☀️ 早安 · {date_str}",
+        f"📍 {city_full}",
+        f"🌤 {weather_text} {temp_min}~{temp_max}℃  {tip}",
+        f"❤️ 我们已经恋爱 {love} 天",
+        f"🎂 婧婧生日还有 {b2} 天",
+        f"💌 {pipi}",
+    ]
+    return "\n".join(lines)
+
+
+def send_morning_via_app() -> bool:
+    """通过自建应用推送早安/天气/情话文本（合并自 4everyL/daily）。"""
+    if not (CORPID and CORPSECRET and AGENTID and TOUSER):
+        return False
+    text = build_morning_text()
+    if not text:
+        log.info("早安消息未配置（缺 HEFENG_KEY/START_DATE/JINGJING_BIRTHDAY），跳过")
+        return False
+    token = get_access_token()
+    if not token:
+        return False
+    body = {
+        "touser": TOUSER,
+        "msgtype": "text",
+        "agentid": AGENTID,
+        "text": {"content": text},
+    }
+    try:
+        resp = http_post_json(f"{WX_API}/message/send?access_token={token}", body)
+    except Exception as exc:
+        log.error("早安消息推送请求失败: %s", exc)
+        return False
+    if resp.get("errcode") != 0:
+        log.error("❌ 早安消息推送失败: %s", resp)
+        return False
+    log.info("✅ 早安消息推送成功")
     return True
 
 
@@ -2515,6 +2707,8 @@ def main() -> int:
                 send_image_via_webhook(image_data)
         elif CORPID and CORPSECRET and AGENTID and TOUSER:
             ok = send_via_app(ctx, image_data=image_data)
+            # 早安 / 天气 / 恋爱小情书（合并自 4everyL/daily）
+            send_morning_via_app()
         elif BOT_ID and BOT_SECRET and CHAT_ID:
             ok = send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
         else:
