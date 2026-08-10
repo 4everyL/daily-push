@@ -2707,8 +2707,7 @@ def main() -> int:
                 send_image_via_webhook(image_data)
         elif CORPID and CORPSECRET and AGENTID and TOUSER:
             ok = send_via_app(ctx, image_data=image_data)
-            # 早安 / 天气 / 恋爱小情书（合并自 4everyL/daily）
-            send_morning_via_app()
+            # 注：早安/天气/恋爱小情书已合并到 weather-push（06:26 推送），此处不再重复发送
         elif BOT_ID and BOT_SECRET and CHAT_ID:
             ok = send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
         else:
