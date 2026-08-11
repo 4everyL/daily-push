@@ -65,18 +65,18 @@ jobs:
       - name: Push to WeChat Work (智能机器人优先，自建应用兜底)
         env:
           MODE: push
-          # 自建应用推送（优先）
-          CORPID: ${{ secrets.CORPID }}
-          CORPSECRET: ${{ secrets.CORPSECRET }}
-          AGENTID: ${{ secrets.AGENTID }}
-          TOUSER: ${{ secrets.TOUSER }}
-          # 群机器人 Webhook（未配 CORPID 时可用）
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          # 智能机器人兜底
+          # 智能机器人（优先）：主动推送仅支持 markdown + template_card
           BOT_ID: ${{ secrets.BOT_ID }}
           BOT_SECRET: ${{ secrets.BOT_SECRET }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           CHAT_TYPE: "1"
+          # 自建应用兜底（text + image，个人微信兼容）
+          CORPID: ${{ secrets.CORPID }}
+          CORPSECRET: ${{ secrets.CORPSECRET }}
+          AGENTID: ${{ secrets.AGENTID }}
+          TOUSER: ${{ secrets.TOUSER }}
+          # 群机器人 Webhook（未配置，留空）
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
           # 早安 / 天气 / 恋爱小情书（合并自 4everyL/daily，原微信公众号测试号推送）
           HEFENG_KEY: ${{ secrets.HEFENG_KEY }}

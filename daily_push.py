@@ -2340,13 +2340,17 @@ def send_via_webhook(ctx: dict[str, Any]) -> bool:
     return False
 
 
-def send_via_aibot(ctx: dict[str, Any], image_data: bytes | None = None) -> bool:
+def send_via_aibot(ctx: dict[str, Any], image_url: str | None = None) -> bool:
     """
     通过企业微信智能机器人长连接 API 主动推送。
     流程：WebSocket 连接 → aibot_subscribe 订阅 → aibot_send_msg 推送 → 关闭。
-    发送 text 纯文本（个人微信完全兼容）+ image 图片（早报图）。
-    注：智能机器人的 markdown / template_card 在个人微信中同样可能提示
-    “暂不支持此消息类型”，故改用 text + image，确保个人微信正常展示。
+
+    重要：官方明确说明「长连接的智能机器人，其主动推送消息仅支持
+    template_card 和 markdown」（不支持 text / image 等）。因此：
+    - 文本摘要用 markdown（智能机器人原生消息类型，企业微信与个人微信
+      均可正常渲染，不会出现“暂不支持此消息类型”——该限制仅存在于
+      自建应用通道）；
+    - 早报图用 template_card 图文卡片（card_image 需要外部图片 URL）。
     """
     if websocket is None:
         log.error("缺少 websocket-client 库，请先 pip install websocket-client")
@@ -2355,7 +2359,11 @@ def send_via_aibot(ctx: dict[str, Any], image_data: bytes | None = None) -> bool
         log.error("缺少 BOT_ID / BOT_SECRET / CHAT_ID，无法使用智能机器人推送")
         return False
 
-    text = build_app_text(ctx)
+    md = build_aibot_markdown(ctx)
+    # markdown 同样有体积上限，做截断保护
+    if len(md.encode("utf-8")) > 4000:
+        md = md.encode("utf-8")[:3990].decode("utf-8", "ignore") + "\n> …（内容过长已截断）"
+
     stop_ev = threading.Event()
     try:
         ws = websocket.create_connection(WS_URL, timeout=30)
@@ -2375,8 +2383,8 @@ def send_via_aibot(ctx: dict[str, Any], image_data: bytes | None = None) -> bool
         body = {
             "chatid": CHAT_ID,
             "chat_type": CHAT_TYPE,
-            "msgtype": "text",
-            "text": {"content": text},
+            "msgtype": "markdown",
+            "markdown": {"content": md},
         }
         resp = _send_cmd(ws, "aibot_send_msg", body)
         if resp.get("errcode") == 0:
@@ -2385,17 +2393,18 @@ def send_via_aibot(ctx: dict[str, Any], image_data: bytes | None = None) -> bool
             log.error("❌ 智能机器人文本推送失败: %s", resp)
             return False
 
-        if image_data:
-            img_body = {
+        if image_url:
+            date: datetime = ctx["date"]
+            card_body = {
                 "chatid": CHAT_ID,
                 "chat_type": CHAT_TYPE,
-                **image_payload(image_data),
+                **template_card_payload(image_url, f"{date:%m月%d日}"),
             }
-            resp2 = _send_cmd(ws, "aibot_send_msg", img_body, timeout=30)
+            resp2 = _send_cmd(ws, "aibot_send_msg", card_body, timeout=30)
             if resp2.get("errcode") == 0:
-                log.info("✅ 智能机器人图片推送成功")
+                log.info("✅ 智能机器人模板卡片推送成功")
             else:
-                log.warning("⚠️ 智能机器人图片推送失败（文本已送达）: %s", resp2)
+                log.error("❌ 智能机器人模板卡片推送失败: %s", resp2)
         return True
     finally:
         stop_ev.set()
@@ -2703,10 +2712,10 @@ def main() -> int:
     if MODE in ("push", "all"):
         ok = False
         tried: list[str] = []
-        # 优先：智能机器人（企微机器人，个人微信兼容 text+image）
+        # 优先：智能机器人（企微机器人，主动推送仅支持 markdown + template_card）
         if BOT_ID and BOT_SECRET and CHAT_ID:
             tried.append("智能机器人")
-            if send_via_aibot(ctx, image_data=image_data):
+            if send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None):
                 ok = True
         # 兜底1：群机器人 Webhook
         if not ok and WEBHOOK_URL:
