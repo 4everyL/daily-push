@@ -62,7 +62,7 @@ jobs:
           echo "等待 Pages 部署生效..."
           sleep 90
 
-      - name: Push to WeChat Work (应用推送优先，智能机器人兜底)
+      - name: Push to WeChat Work (智能机器人优先，自建应用兜底)
         env:
           MODE: push
           # 自建应用推送（优先）

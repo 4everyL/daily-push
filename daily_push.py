@@ -2340,11 +2340,13 @@ def send_via_webhook(ctx: dict[str, Any]) -> bool:
     return False
 
 
-def send_via_aibot(ctx: dict[str, Any], image_url: str | None = None) -> bool:
+def send_via_aibot(ctx: dict[str, Any], image_data: bytes | None = None) -> bool:
     """
     通过企业微信智能机器人长连接 API 主动推送。
     流程：WebSocket 连接 → aibot_subscribe 订阅 → aibot_send_msg 推送 → 关闭。
-    如传入 image_url，推送完 markdown 后继续发送一条模板卡片（封面即早报图）。
+    发送 text 纯文本（个人微信完全兼容）+ image 图片（早报图）。
+    注：智能机器人的 markdown / template_card 在个人微信中同样可能提示
+    “暂不支持此消息类型”，故改用 text + image，确保个人微信正常展示。
     """
     if websocket is None:
         log.error("缺少 websocket-client 库，请先 pip install websocket-client")
@@ -2353,7 +2355,7 @@ def send_via_aibot(ctx: dict[str, Any], image_url: str | None = None) -> bool:
         log.error("缺少 BOT_ID / BOT_SECRET / CHAT_ID，无法使用智能机器人推送")
         return False
 
-    md = build_aibot_markdown(ctx)
+    text = build_app_text(ctx)
     stop_ev = threading.Event()
     try:
         ws = websocket.create_connection(WS_URL, timeout=30)
@@ -2373,29 +2375,27 @@ def send_via_aibot(ctx: dict[str, Any], image_url: str | None = None) -> bool:
         body = {
             "chatid": CHAT_ID,
             "chat_type": CHAT_TYPE,
-            "msgtype": "markdown",
-            "markdown": {"content": md},
+            "msgtype": "text",
+            "text": {"content": text},
         }
         resp = _send_cmd(ws, "aibot_send_msg", body)
-        ok = resp.get("errcode") == 0
-        if ok:
-            log.info("✅ 智能机器人推送成功")
+        if resp.get("errcode") == 0:
+            log.info("✅ 智能机器人文本推送成功")
         else:
-            log.error("❌ 智能机器人推送失败: %s", resp)
+            log.error("❌ 智能机器人文本推送失败: %s", resp)
             return False
 
-        if image_url:
-            date: datetime = ctx["date"]
-            card_body = {
+        if image_data:
+            img_body = {
                 "chatid": CHAT_ID,
                 "chat_type": CHAT_TYPE,
-                **template_card_payload(image_url, f"{date:%m月%d日}"),
+                **image_payload(image_data),
             }
-            resp2 = _send_cmd(ws, "aibot_send_msg", card_body, timeout=30)
+            resp2 = _send_cmd(ws, "aibot_send_msg", img_body, timeout=30)
             if resp2.get("errcode") == 0:
-                log.info("✅ 智能机器人模板卡片推送成功")
+                log.info("✅ 智能机器人图片推送成功")
             else:
-                log.error("❌ 智能机器人模板卡片推送失败: %s", resp2)
+                log.warning("⚠️ 智能机器人图片推送失败（文本已送达）: %s", resp2)
         return True
     finally:
         stop_ev.set()
@@ -2701,22 +2701,30 @@ def main() -> int:
         write_html_files(html, ctx["date"])
 
     if MODE in ("push", "all"):
-        if WEBHOOK_URL:
-            ok = send_via_webhook(ctx)
-            if ok and image_data:
-                send_image_via_webhook(image_data)
-        elif CORPID and CORPSECRET and AGENTID and TOUSER:
-            ok = send_via_app(ctx, image_data=image_data)
-            # 注：早安/天气/恋爱小情书已合并到 weather-push（06:26 推送），此处不再重复发送
-        elif BOT_ID and BOT_SECRET and CHAT_ID:
-            ok = send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
-        else:
-            log.error(
-                "未配置任何推送方式（WEBHOOK_URL / 企业微信应用 CORPID+CORPSECRET+AGENTID+TOUSER / "
-                "智能机器人 BOT_ID+BOT_SECRET+CHAT_ID）"
-            )
-            ok = False
+        ok = False
+        tried: list[str] = []
+        # 优先：智能机器人（企微机器人，个人微信兼容 text+image）
+        if BOT_ID and BOT_SECRET and CHAT_ID:
+            tried.append("智能机器人")
+            if send_via_aibot(ctx, image_data=image_data):
+                ok = True
+        # 兜底1：群机器人 Webhook
+        if not ok and WEBHOOK_URL:
+            tried.append("群机器人")
+            if send_via_webhook(ctx):
+                if image_data:
+                    send_image_via_webhook(image_data)
+                ok = True
+        # 兜底2：企业微信自建应用（text+image，个人微信兼容）
+        if not ok and CORPID and CORPSECRET and AGENTID and TOUSER:
+            tried.append("企业微信应用")
+            if send_via_app(ctx, image_data=image_data):
+                ok = True
         if not ok:
+            log.error(
+                "所有推送通道均失败，已尝试: %s",
+                " / ".join(tried) or "无（缺少任意一组凭据）",
+            )
             return 1
 
     return 0
