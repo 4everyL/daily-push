@@ -2,9 +2,7 @@ name: Daily Push
 
 # 每天北京时间 07:45 触发（UTC 23:45，前一天）
 on:
-  schedule:
-    - cron: "45 23 * * *"
-  workflow_dispatch:     # 支持在 GitHub UI 手动触发
+  workflow_dispatch:     # 触发改由 weather-push 仓库的定时跨仓库唤醒（其 schedule 在 GitHub 上可靠）
 
 # 允许 workflow push 归档 HTML
 permissions:
