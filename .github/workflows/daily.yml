@@ -3,9 +3,6 @@ name: Daily Push
 # 每天北京时间 07:00 触发（UTC 23:00，前一天）
 on:
   workflow_dispatch:     # 触发改由 weather-push 仓库的定时跨仓库唤醒（其 schedule 在 GitHub 上可靠）
-  push:
-    tags:
-      - 'test-trigger'   # 临时：本地手动触发测试用，测后移除
 
 # 允许 workflow push 归档 HTML
 permissions:
@@ -76,8 +73,8 @@ jobs:
           CORPSECRET: ${{ secrets.CORPSECRET }}
           AGENTID: ${{ secrets.AGENTID }}
           TOUSER: ${{ secrets.TOUSER }}
-          # 群机器人 Webhook（企微群聊推送；硬编码因当前无法用 API 写入 Secrets）
-          WEBHOOK_URL: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=9a1bae5b-8b85-4f7a-b8f4-6f7ffc8d12f6"
+          # 群机器人 Webhook（企微群聊推送， Secrets 中配置）
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
           # 早安 / 天气 / 恋爱小情书（合并自 4everyL/daily，原微信公众号测试号推送）
           HEFENG_KEY: ${{ secrets.HEFENG_KEY }}
