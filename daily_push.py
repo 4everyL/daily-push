@@ -2710,30 +2710,31 @@ def main() -> int:
         write_html_files(html, ctx["date"])
 
     if MODE in ("push", "all"):
-        ok = False
-        tried: list[str] = []
-        # 优先：智能机器人（企微机器人，主动推送仅支持 markdown + template_card）
+        results: list[tuple[str, bool]] = []
+        # 群机器人（企微群聊）——始终发送，不依赖私聊通道结果
+        if WEBHOOK_URL:
+            ok_w = send_via_webhook(ctx)
+            if ok_w and image_data:
+                send_image_via_webhook(image_data)
+            results.append(("群机器人", ok_w))
+        # 私聊：智能机器人（优先）
         if BOT_ID and BOT_SECRET and CHAT_ID:
-            tried.append("智能机器人")
-            if send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None):
-                ok = True
-        # 兜底1：群机器人 Webhook
-        if not ok and WEBHOOK_URL:
-            tried.append("群机器人")
-            if send_via_webhook(ctx):
-                if image_data:
-                    send_image_via_webhook(image_data)
-                ok = True
-        # 兜底2：企业微信自建应用（text+image，个人微信兼容）
-        if not ok and CORPID and CORPSECRET and AGENTID and TOUSER:
-            tried.append("企业微信应用")
-            if send_via_app(ctx, image_data=image_data):
-                ok = True
-        if not ok:
+            ok_a = send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
+            results.append(("智能机器人", ok_a))
+        # 私聊：企业微信自建应用（text+image，个人微信兼容）
+        if CORPID and CORPSECRET and AGENTID and TOUSER:
+            ok_c = send_via_app(ctx, image_data=image_data)
+            results.append(("企业微信应用", ok_c))
+        if not results:
             log.error(
-                "所有推送通道均失败，已尝试: %s",
-                " / ".join(tried) or "无（缺少任意一组凭据）",
+                "未配置任何推送通道（WEBHOOK_URL / 智能机器人 / 自建应用 均无）"
             )
+            return 1
+        for name, ok in results:
+            if not ok:
+                log.warning("⚠️ 通道「%s」本次未发送成功", name)
+        # 群与私聊任一成功即视为整体成功
+        if not any(ok for _, ok in results):
             return 1
 
     return 0
