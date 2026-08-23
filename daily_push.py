@@ -40,7 +40,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -573,8 +573,8 @@ def get_daily_news() -> list[dict[str, str]]:
       1) viki GitHub raw 静态托管（按北京日期，今/昨回退）——CI 友好，GitHub 域名不被封
       2) viki API 多实例（备源，部分网络环境可用；GitHub runner 出口 IP 常被其封禁）
     """
-    # 北京时间（GitHub runner 默认 UTC，需 +8h）
-    bj = datetime.now() + timedelta(hours=8)
+    # 北京时间（显式基于 UTC 计算，不依赖 runner 本地时区，避免重复 +8h）
+    bj = datetime.now(timezone.utc) + timedelta(hours=8)
     today = bj.strftime("%Y-%m-%d")
     yesterday = (bj - timedelta(days=1)).strftime("%Y-%m-%d")
     raw: list[str] = []
