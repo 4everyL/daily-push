@@ -60,15 +60,10 @@ jobs:
           echo "等待 Pages 部署生效..."
           sleep 90
 
-      - name: Push to WeChat Work (智能机器人优先，自建应用兜底)
+      - name: Push to WeChat Work (群机器人 + 自建应用)
         env:
           MODE: push
-          # 智能机器人（优先）：主动推送仅支持 markdown + template_card
-          BOT_ID: ${{ secrets.BOT_ID }}
-          BOT_SECRET: ${{ secrets.BOT_SECRET }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          CHAT_TYPE: "1"
-          # 自建应用兜底（text + image，个人微信兼容）
+          # 自建应用私聊（text + image，个人微信兼容）
           CORPID: ${{ secrets.CORPID }}
           CORPSECRET: ${{ secrets.CORPSECRET }}
           AGENTID: ${{ secrets.AGENTID }}

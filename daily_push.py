@@ -51,6 +51,14 @@ except ImportError:
 
 
 BASE_API = "https://60s.viki.moe/v2"
+
+# 60s 每日新闻多源容灾：主源 + 备用实例（同源，返回格式一致）。
+# 任一可用即可，避免单点过期导致早报「60秒看世界」整段空白。
+NEWS_API_CANDIDATES = [
+    "https://60s.viki.moe/v2/60s",
+    "https://60s-api.viki.moe/v2/60s",
+    "https://api.viki.moe/v2/60s",
+]
 HTTP_TIMEOUT = 10
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -137,6 +145,28 @@ def http_get_json(path: str, retries: int = 2) -> dict[str, Any] | None:
                 log.info("Retrying %s in %ds...", path, wait)
                 time.sleep(wait)
     log.warning("API %s all attempts failed: %s", path, last_exc)
+    return None
+
+
+def fetch_json_url(url: str, retries: int = 2) -> dict[str, Any] | None:
+    """带指数退避重试的 GET（接受完整 URL），返回 data 字段或 None。"""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if payload.get("code") != 200:
+                log.warning("API %s code=%s", url, payload.get("code"))
+                return None
+            return payload.get("data")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_exc = exc
+            wait = 2 ** attempt
+            log.warning("API %s attempt %d/%d failed: %s", url, attempt + 1, retries + 1, exc)
+            if attempt < retries:
+                time.sleep(wait)
+    log.warning("API %s all attempts failed: %s", url, last_exc)
     return None
 
 
@@ -522,9 +552,22 @@ def get_daily_news() -> list[dict[str, str]]:
     """
     返回 60 秒每日新闻，每条是 {text, link}
     点击后跳转到百度搜索该新闻关键词。
+    多源容灾：依次尝试 NEWS_API_CANDIDATES，首个返回有效 news 的源即采用。
     """
-    data = http_get_json("/60s") or {}
-    raw = data.get("news") or []
+    raw: list[str] = []
+    for url in NEWS_API_CANDIDATES:
+        try:
+            data = fetch_json_url(url) or {}
+            news = data.get("news") or []
+            if news:
+                raw = news
+                log.info("✅ 60s 新闻取自 %s（%d 条）", url, len(raw))
+                break
+            log.warning("60s 源 %s 返回空 news", url)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("60s 源 %s 异常: %s", url, exc)
+    if not raw:
+        log.warning("⚠️ 所有 60s 新闻源均不可用，今日「60秒看世界」为空")
     out: list[dict[str, str]] = []
     for text in raw:
         # 提取前 20 字作为搜索关键词（去掉开头的数字年份等）
@@ -2717,17 +2760,13 @@ def main() -> int:
             if ok_w and image_data:
                 send_image_via_webhook(image_data)
             results.append(("群机器人", ok_w))
-        # 私聊：智能机器人（优先）
-        if BOT_ID and BOT_SECRET and CHAT_ID:
-            ok_a = send_via_aibot(ctx, image_url=UUHB_60S_IMAGE_URL if image_data else None)
-            results.append(("智能机器人", ok_a))
         # 私聊：企业微信自建应用（text+image，个人微信兼容）
         if CORPID and CORPSECRET and AGENTID and TOUSER:
             ok_c = send_via_app(ctx, image_data=image_data)
             results.append(("企业微信应用", ok_c))
         if not results:
             log.error(
-                "未配置任何推送通道（WEBHOOK_URL / 智能机器人 / 自建应用 均无）"
+                "未配置任何推送通道（WEBHOOK_URL / 自建应用 均无）"
             )
             return 1
         for name, ok in results:
