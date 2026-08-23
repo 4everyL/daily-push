@@ -50,11 +50,20 @@ except ImportError:
     websocket = None
 
 
-BASE_API = "https://60s.viki.moe/v2"
+# 60s API 公共实例列表（热搜 / 豆瓣 / 网易云 / 段子等均来自此 API）。
+# GitHub Actions runner 出口 IP 常被主域名 60s.viki.moe 封禁(403)，
+# 因此维护一个候选列表，任一实例可用即可，提升 CI 稳定性。
+BASE_API_CANDIDATES = [
+    "https://60s.mizhoubaobei.top/v2",
+    "https://60s.7se.cn/v2",
+    "https://60s.viki.moe/v2",
+]
 
 # 60s 新闻备源：viki API 多实例（与 raw 主源同源，仅作非封环境兜底）。
 # 注意：GitHub runner 出口 IP 常被 viki 封禁(403)，故主源改用 GitHub raw 静态托管。
 NEWS_API_CANDIDATES = [
+    "https://60s.mizhoubaobei.top/v2/60s",
+    "https://60s.7se.cn/v2/60s",
     "https://60s.viki.moe/v2/60s",
     "https://60s-api.viki.moe/v2/60s",
     "https://api.viki.moe/v2/60s",
@@ -125,26 +134,27 @@ log = logging.getLogger("daily_push")
 # ---------------------------------------------------------------------------
 
 def http_get_json(path: str, retries: int = 2) -> dict[str, Any] | None:
-    """带指数退避重试的 GET，降低 CI 环境偶发 429/500 导致整段空白。"""
-    url = f"{BASE_API}{path}"
+    """带指数退避重试的 GET；自动在多实例间切换，降低单域名被封导致整段空白。"""
     last_exc: Exception | None = None
-    for attempt in range(retries + 1):
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            if payload.get("code") != 200:
-                log.warning("API %s code=%s", path, payload.get("code"))
-                return None
-            return payload.get("data")
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            last_exc = exc
-            wait = 2 ** attempt
-            log.warning("API %s attempt %d/%d failed: %s", path, attempt + 1, retries + 1, exc)
-            if attempt < retries:
-                log.info("Retrying %s in %ds...", path, wait)
-                time.sleep(wait)
-    log.warning("API %s all attempts failed: %s", path, last_exc)
+    for base in BASE_API_CANDIDATES:
+        url = f"{base}{path}"
+        for attempt in range(retries + 1):
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            try:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                if payload.get("code") != 200:
+                    log.warning("API %s code=%s", url, payload.get("code"))
+                    break  # 该实例返回业务错误，尝试下一个实例
+                return payload.get("data")
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                last_exc = exc
+                wait = 2 ** attempt
+                log.warning("API %s attempt %d/%d failed: %s", url, attempt + 1, retries + 1, exc)
+                if attempt < retries:
+                    log.info("Retrying %s in %ds...", url, wait)
+                    time.sleep(wait)
+    log.warning("API %s all candidates failed: %s", path, last_exc)
     return None
 
 
