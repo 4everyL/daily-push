@@ -40,7 +40,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -52,8 +52,8 @@ except ImportError:
 
 BASE_API = "https://60s.viki.moe/v2"
 
-# 60s 每日新闻多源容灾：主源 + 备用实例（同源，返回格式一致）。
-# 任一可用即可，避免单点过期导致早报「60秒看世界」整段空白。
+# 60s 新闻备源：viki API 多实例（与 raw 主源同源，仅作非封环境兜底）。
+# 注意：GitHub runner 出口 IP 常被 viki 封禁(403)，故主源改用 GitHub raw 静态托管。
 NEWS_API_CANDIDATES = [
     "https://60s.viki.moe/v2/60s",
     "https://60s-api.viki.moe/v2/60s",
@@ -548,24 +548,55 @@ def collect_media() -> dict[str, list[dict[str, str]]]:
     return media
 
 
+def _fetch_viki_raw(date_str: str) -> list[str] | None:
+    """从 viki 的 GitHub 静态托管读取某天 60s（CI 友好：GitHub raw 域名不被封）。"""
+    url = (
+        "https://raw.githubusercontent.com/vikiboss/60s-static-host/main/"
+        f"static/60s/{date_str}.json"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+        news = d.get("news") or []
+        return news if news else None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("viki raw(%s) 失败: %s", date_str, exc)
+        return None
+
+
 def get_daily_news() -> list[dict[str, str]]:
     """
-    返回 60 秒每日新闻，每条是 {text, link}
-    点击后跳转到百度搜索该新闻关键词。
-    多源容灾：依次尝试 NEWS_API_CANDIDATES，首个返回有效 news 的源即采用。
+    返回 60 秒每日新闻，每条是 {text, link}，点击跳百度搜索该新闻关键词。
+
+    数据源优先级：
+      1) viki GitHub raw 静态托管（按北京日期，今/昨回退）——CI 友好，GitHub 域名不被封
+      2) viki API 多实例（备源，部分网络环境可用；GitHub runner 出口 IP 常被其封禁）
     """
+    # 北京时间（GitHub runner 默认 UTC，需 +8h）
+    bj = datetime.now() + timedelta(hours=8)
+    today = bj.strftime("%Y-%m-%d")
+    yesterday = (bj - timedelta(days=1)).strftime("%Y-%m-%d")
     raw: list[str] = []
-    for url in NEWS_API_CANDIDATES:
-        try:
-            data = fetch_json_url(url) or {}
-            news = data.get("news") or []
-            if news:
-                raw = news
-                log.info("✅ 60s 新闻取自 %s（%d 条）", url, len(raw))
-                break
-            log.warning("60s 源 %s 返回空 news", url)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("60s 源 %s 异常: %s", url, exc)
+    # 主源：GitHub raw 静态托管
+    for ds in (today, yesterday):
+        n = _fetch_viki_raw(ds)
+        if n:
+            raw = n
+            log.info("✅ 60s 新闻取自 viki raw(%s)，%d 条", ds, len(raw))
+            break
+    # 备源：viki API（CI 可能被封，其他环境兜底）
+    if not raw:
+        for url in NEWS_API_CANDIDATES:
+            try:
+                data = fetch_json_url(url) or {}
+                n = data.get("news") or []
+                if n:
+                    raw = n
+                    log.info("✅ 60s 新闻取自 %s，%d 条", url, len(raw))
+                    break
+            except Exception as exc:  # noqa: BLE001
+                log.warning("60s 源 %s 异常: %s", url, exc)
     if not raw:
         log.warning("⚠️ 所有 60s 新闻源均不可用，今日「60秒看世界」为空")
     out: list[dict[str, str]] = []
